@@ -8,6 +8,10 @@ It also includes methods for multimedia interactions like playing sounds and loo
 
 import asyncio
 import logging
+import os
+import subprocess
+import tempfile
+import threading
 import time
 import warnings
 from importlib.metadata import PackageNotFoundError, version
@@ -15,7 +19,9 @@ from typing import Dict, List, Literal, Optional, Union, cast
 
 import numpy as np
 import numpy.typing as npt
+import soundfile as sf
 from asgiref.sync import async_to_sync
+from scipy.signal import resample
 
 from reachy_mini.daemon.utils import daemon_check, is_local_camera_available
 from reachy_mini.io.protocol import (
@@ -52,6 +58,8 @@ from reachy_mini.vision.look_at import (
 
 # Behavior definitions
 INIT_HEAD_POSE = np.eye(4)
+WAKE_UP_SENTENCE = "Hello! My name is Mini, and I, am a member of the Intelligent Data Science Lab."
+VOICE = "en-US-AvaNeural"
 
 SLEEP_HEAD_JOINT_POSITIONS = [
     0,
@@ -163,6 +171,7 @@ class ReachyMini:
         self.is_recording = False
         self._move_cancelled = False
         self._media_released = False
+        self.wiggle = False
         self._log_level = log_level
         self._media_backend = media_backend
 
@@ -418,7 +427,7 @@ class ReachyMini:
         sdk_version = sdk_version.strip()
         daemon_version = daemon_version.strip()
 
-        if sdk_version == daemon_version:
+        if sdk_version == daemon_version or sdk_version.split(".dev")[0] == daemon_version.split(".dev")[0]:
             return
 
         warnings.warn(
@@ -725,21 +734,162 @@ class ReachyMini:
         task_uid = self.client.send_task_request(req)
         self.client.wait_for_task_completion(task_uid, timeout=duration + 1.0)
 
-    def wake_up(self) -> None:
-        """Wake up the robot - go to the initial head position and play the wake up emote and sound."""
-        self.goto_target(INIT_HEAD_POSE, antennas=INIT_ANTENNAS_JOINT_POSITIONS, duration=2)
-        time.sleep(0.1)
+    def wake_up(
+        self,
+        speak: bool = True,
+        sentence: Optional[str] = WAKE_UP_SENTENCE,
+        voice: str = VOICE,
+        say_on_start: Optional[np.ndarray] = None,
+    ) -> None:
+        """Wake up the robot - animate antennas/head and speak the wake up greeting.
 
-        # Toudoum
-        self.media.play_sound("wake_up.wav")
+        Args:
+            speak: If True, speaks the wake-up greeting sentence through the robot's speaker.
+            sentence: Sentence to speak on wake-up (defaults to Intelligent Data Science Lab greeting).
+            voice: Microsoft Edge TTS voice model name.
+            say_on_start: Optional pre-rendered float32 audio numpy array to play instead of synthesizing.
+        """
+        self.wiggle = True
+        wiggle_thread = threading.Thread(target=self.wiggle_antennas, daemon=True)
+        wiggle_thread.start()
+        time.sleep(1.0)
+
+        audio = say_on_start
+        if audio is None and speak and sentence:
+            audio = self.generate_audio(sentence, voice=voice)
+
+        if audio is not None:
+            if hasattr(self.media, "start_playing"):
+                self.media.start_playing()
+            self.media.push_audio_sample(audio)
+            target_sr = self.media.get_output_audio_samplerate()
+            if target_sr > 0:
+                duration = len(audio) / target_sr
+                time.sleep(duration + 0.5)
+
+        self.wiggle = False
+        wiggle_thread.join(timeout=2.0)
+        self.goto_target(INIT_HEAD_POSE, antennas=[0.0, 0.0], body_yaw=0.0, duration=0.5)
+
+    def wiggle_antennas(self) -> None:
+        """Wiggle the antennas and perform the wake-up motion emote."""
+        self.goto_target(INIT_HEAD_POSE, duration=1.0)
+        time.sleep(0.2)
+
+        # Toudoum chime
+        try:
+            self.media.play_sound("wake_up.wav")
+        except Exception as exc:
+            self.logger.debug("play_sound error: %s", exc)
 
         # Roll 20° to the left
         pose = INIT_HEAD_POSE.copy()
         pose[:3, :3] = R.from_euler("xyz", [20, 0, 0], degrees=True).as_matrix()
-        self.goto_target(pose, duration=0.2)
+        self.goto_target(pose, duration=0.3)
+        time.sleep(0.3)
+        self.goto_target(INIT_HEAD_POSE, antennas=[0.0, 0.0], body_yaw=0.0, duration=1.0)
 
-        # Go back to the initial position
-        self.goto_target(INIT_HEAD_POSE, duration=0.2)
+        while self.wiggle:
+            time.sleep(0.1)
+            if not self.wiggle:
+                break
+            self.goto_target(head=INIT_HEAD_POSE, antennas=[0.5, -0.5], duration=0.4)
+            time.sleep(0.1)
+            if not self.wiggle:
+                break
+            self.goto_target(head=INIT_HEAD_POSE, antennas=[-0.5, 0.5], duration=0.4)
+
+    def generate_audio(self, text: str, voice: str = VOICE) -> Optional[np.ndarray]:
+        """Generate audio from text using edge-tts.
+
+        Args:
+            text: Text to synthesize.
+            voice: Edge TTS voice name (defaults to VOICE).
+
+        Returns:
+            Float32 numpy array shaped (samples, 1) resampled to the robot's
+            output sample rate, or None on failure.
+        """
+        self.logger.info("Generating audio for text: %s", text)
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
+            mp3_path = mp3_file.name
+
+        try:
+            # 1. Generate MP3 (try in-process edge_tts first, fallback to CLI)
+            generated = False
+            try:
+                import edge_tts
+
+                async def _save():
+                    com = edge_tts.Communicate(text, voice)
+                    await com.save(mp3_path)
+
+                try:
+                    asyncio.run(_save())
+                    generated = True
+                except RuntimeError:
+                    import concurrent.futures
+
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        pool.submit(lambda: asyncio.run(_save())).result()
+                    generated = True
+            except Exception as exc:
+                self.logger.debug("In-process edge_tts failed (%s), falling back to CLI...", exc)
+
+            if not generated:
+                cmd = ["edge-tts", "--voice", voice, "--text", text, "--write-media", mp3_path]
+                subprocess.run(
+                    cmd,
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+
+            # 2. Convert MP3 to WAV using ffmpeg
+            wav_path = mp3_path.replace(".mp3", ".wav")
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", mp3_path, "-f", "wav", wav_path],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            # 3. Read WAV file
+            loss_audio, file_sample_rate = sf.read(wav_path)
+            loss_audio = loss_audio.astype(np.float32)
+
+            # 4. Get device output sample rate and resample if needed
+            target_sr = self.media.get_output_audio_samplerate()
+            self.logger.info("Audio File SR: %d, Target Device SR: %d", file_sample_rate, target_sr)
+
+            if target_sr > 0 and file_sample_rate != target_sr:
+                self.logger.info("Resampling from %d to %d...", file_sample_rate, target_sr)
+                num_samples = int(len(loss_audio) * target_sr / file_sample_rate)
+                loss_audio = resample(loss_audio, num_samples)
+
+            # 5. Format shape for push_audio_sample (samples, 1)
+            if loss_audio.ndim == 1:
+                loss_audio = loss_audio.reshape(-1, 1)
+
+            return loss_audio
+
+        except subprocess.CalledProcessError as exc:
+            self.logger.error("Error generating or converting TTS: %s", exc)
+            return None
+        except Exception as exc:
+            self.logger.error("Error creating TTS audio: %s", exc)
+            return None
+        finally:
+            if os.path.exists(mp3_path):
+                try:
+                    os.remove(mp3_path)
+                except OSError:
+                    pass
+            if "wav_path" in locals() and os.path.exists(wav_path):
+                try:
+                    os.remove(wav_path)
+                except OSError:
+                    pass
 
     def goto_sleep(self) -> None:
         """Put the robot to sleep by moving the head and antennas to a predefined sleep position."""
