@@ -799,18 +799,31 @@ class ReachyMini:
                 break
             self.goto_target(head=INIT_HEAD_POSE, antennas=[-0.5, 0.5], duration=0.4)
 
-    def generate_audio(self, text: str, voice: str = VOICE) -> Optional[np.ndarray]:
+    def set_volume(self, volume: int) -> None:
+        """Set the robot output speaker volume (0 to 100)."""
+        from reachy_mini.io.protocol import SetVolumeCmd
+
+        vol = max(0, min(100, int(volume)))
+        try:
+            if hasattr(self.client, "send_command"):
+                self.client.send_command(SetVolumeCmd(volume=vol))
+                self.logger.info("Set robot speaker volume to %d%%", vol)
+        except Exception as exc:
+            self.logger.warning("Could not set volume via client: %s", exc)
+
+    def generate_audio(self, text: str, voice: str = VOICE, volume: str = "+0%") -> Optional[np.ndarray]:
         """Generate audio from text using edge-tts.
 
         Args:
             text: Text to synthesize.
             voice: Edge TTS voice name (defaults to VOICE).
+            volume: Volume adjustment string for edge-tts (e.g. "+50%").
 
         Returns:
             Float32 numpy array shaped (samples, 1) resampled to the robot's
             output sample rate, or None on failure.
         """
-        self.logger.info("Generating audio for text: %s", text)
+        self.logger.info("Generating audio for text: %s (voice=%s, volume=%s)", text, voice, volume)
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as mp3_file:
             mp3_path = mp3_file.name
 
@@ -821,7 +834,7 @@ class ReachyMini:
                 import edge_tts
 
                 async def _save():
-                    com = edge_tts.Communicate(text, voice)
+                    com = edge_tts.Communicate(text, voice, volume=volume)
                     await com.save(mp3_path)
 
                 try:
@@ -837,7 +850,10 @@ class ReachyMini:
                 self.logger.debug("In-process edge_tts failed (%s), falling back to CLI...", exc)
 
             if not generated:
-                cmd = ["edge-tts", "--voice", voice, "--text", text, "--write-media", mp3_path]
+                cmd = ["edge-tts", "--voice", voice, "--text", text]
+                if volume and volume != "+0%":
+                    cmd.extend(["--volume", volume])
+                cmd.extend(["--write-media", mp3_path])
                 subprocess.run(
                     cmd,
                     check=True,
